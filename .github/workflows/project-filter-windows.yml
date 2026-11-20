@@ -1,0 +1,108 @@
+name: Build project-filter CLI for Windows
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Official Codex release tag
+        required: true
+        default: rust-v0.171.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 215
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '1'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: feature/project-session-filter
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Apply the public feature patch to the requested release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git diff --binary HEAD^ HEAD -- codex-rs > "$RUNNER_TEMP/project-filter.patch"
+          test -s "$RUNNER_TEMP/project-filter.patch"
+          git fetch --depth=1 --no-tags https://github.com/openai/codex.git "refs/tags/$RELEASE_TAG"
+          git checkout --detach FETCH_HEAD
+          git apply --3way "$RUNNER_TEMP/project-filter.patch"
+
+      - uses: ./.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+          key: project-filter-win-v1-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ inputs.tag }}
+          restore-keys: |
+            project-filter-win-v1-
+
+      - name: Prepare the pinned V8 crate without Chromium submodules
+        shell: pwsh
+        run: |
+          $manifest = Resolve-Path codex-rs/Cargo.toml
+          $content = [IO.File]::ReadAllText($manifest)
+          $pin = [regex]::Match($content, '(?m)^v8 = \{ git = "(https://github\.com/openai-oss-forks/rusty_v8\.git)", rev = "([a-f0-9]{40})" \}')
+          if (!$pin.Success) { throw 'Check the V8 dependency declaration for this release' }
+          $source = Join-Path $env:RUNNER_TEMP v8
+          git init -q $source
+          git -C $source fetch --depth=1 $pin.Groups[1].Value $pin.Groups[2].Value
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git -C $source -c core.longpaths=true checkout -q FETCH_HEAD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $replacement = 'v8 = { path = "' + ($source -replace '\\','/') + '" }'
+          [IO.File]::WriteAllText($manifest, $content.Replace($pin.Value, $replacement))
+
+      - name: Build patched CLI
+        working-directory: codex-rs
+        run: cargo build --release --timings -j 2 -p codex-cli --bin codex
+
+      - name: Package CLI with matching official Windows helpers
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cli = "$env:CARGO_TARGET_DIR/release/codex.exe"
+          $version = & $cli --version
+          if ($LASTEXITCODE -or $version -ne ('codex-cli ' + $env:RELEASE_TAG.Substring(6))) { throw "Unexpected version $version" }
+          New-Item -ItemType Directory -Path bundle/codex-resources -Force | Out-Null
+          Copy-Item $cli bundle/codex.exe
+          $json = gh api "repos/openai/codex/releases/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $release = $json | ConvertFrom-Json
+          foreach ($name in 'codex-code-mode-host','codex-exec-server','codex-command-runner','codex-windows-sandbox-setup') {
+            $asset = $release.assets | Where-Object name -eq "$name-x86_64-pc-windows-msvc.exe"
+            if (!$asset -or $asset.digest -notmatch '^sha256:[a-fA-F0-9]{64}$') { throw "Missing digest for $name" }
+            $dir = if ($name -in 'codex-command-runner','codex-windows-sandbox-setup') { 'bundle/codex-resources' } else { 'bundle' }
+            $path = "$dir/$name.exe"
+            curl.exe -fLsS --retry 3 -o $path $asset.browser_download_url
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if ('sha256:' + (Get-FileHash $path).Hash -ne $asset.digest) { throw "Hash mismatch for $name" }
+          }
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-project-filter-${{ inputs.tag }}-windows-x64
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 7
