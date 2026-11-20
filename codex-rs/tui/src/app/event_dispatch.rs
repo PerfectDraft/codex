@@ -2123,7 +2123,6 @@ impl App {
                 app_server.task_search.cancel();
                 self.file_search.on_user_query(query.clone());
                 if let Some(thread_id) = self.active_thread_id
-                    && app_server.task_tools_available(thread_id)
                     && self.config.features.enabled(Feature::MentionsV2)
                 {
                     let cwd = self
@@ -2154,9 +2153,7 @@ impl App {
                 query,
                 matches,
             } => {
-                if self.active_thread_id == Some(thread_id)
-                    && app_server.task_tools_available(thread_id)
-                {
+                if self.active_thread_id == Some(thread_id) {
                     self.chat_widget.on_task_search_result(&query, matches);
                 }
             }

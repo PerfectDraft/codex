@@ -8,7 +8,9 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 
 use super::PickerState;
+use super::SessionFilterMode;
 use super::list_viewport_width;
+use super::project_control_spans;
 use super::render_list;
 use super::render_picker_footer;
 use super::render_transcript_loading_overlay;
@@ -18,22 +20,25 @@ use super::toolbar_for_width;
 pub(super) struct PickerAreas {
     header: Rect,
     toolbar: Rect,
+    project: Rect,
     search: Rect,
     pub(super) list: Rect,
     footer: Rect,
 }
 
-pub(super) fn areas(area: Rect) -> PickerAreas {
-    let fixed_chrome_rows = 7;
+pub(super) fn areas(area: Rect, state: &PickerState) -> PickerAreas {
+    let project_rows = u16::from(state.filter_mode == SessionFilterMode::Project);
+    let fixed_chrome_rows = 7 + project_rows;
     const MIN_LIST_ROWS: u16 = 6;
     let gaps = area
         .height
         .saturating_sub(fixed_chrome_rows + MIN_LIST_ROWS)
         .min(/*other*/ 3);
-    let [header, _, toolbar, _, search, _, list, footer] = Layout::vertical([
+    let [header, _, toolbar, project, _, search, _, list, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(u16::from(gaps >= 3)),
         Constraint::Length(1),
+        Constraint::Length(project_rows),
         Constraint::Length(u16::from(gaps >= 2)),
         Constraint::Length(1),
         Constraint::Length(u16::from(gaps >= 1)),
@@ -44,6 +49,7 @@ pub(super) fn areas(area: Rect) -> PickerAreas {
     PickerAreas {
         header,
         toolbar,
+        project,
         search,
         list,
         footer,
@@ -54,10 +60,11 @@ pub(super) fn render(frame: &mut crate::custom_terminal::Frame, state: &PickerSt
     let PickerAreas {
         header,
         toolbar,
+        project,
         search,
         list,
         footer,
-    } = areas(frame.area());
+    } = areas(frame.area(), state);
     let chrome = |area: Rect| {
         Rect::new(
             area.x.saturating_add(/*rhs*/ 1),
@@ -69,6 +76,9 @@ pub(super) fn render(frame: &mut crate::custom_terminal::Frame, state: &PickerSt
     frame.render_widget_ref(&Line::from(state.action.title().bold()), chrome(header));
     let toolbar = chrome(toolbar);
     frame.render_widget_ref(&toolbar_for_width(state, toolbar.width), toolbar);
+    if project.height > 0 {
+        frame.render_widget_ref(&Line::from(project_control_spans(state)), chrome(project));
+    }
     let search = chrome(search);
     frame.render_widget_ref(&search_line(state, search.width), search);
     let list = Rect::new(
@@ -77,7 +87,11 @@ pub(super) fn render(frame: &mut crate::custom_terminal::Frame, state: &PickerSt
         list_viewport_width(list.width),
         list.height,
     );
-    render_list(frame, list, state);
+    if state.project_destination.is_some() {
+        super::project_actions::render(frame, list, state);
+    } else {
+        render_list(frame, list, state);
+    }
     if state.is_transcript_loading() {
         render_transcript_loading_overlay(frame, list);
     }

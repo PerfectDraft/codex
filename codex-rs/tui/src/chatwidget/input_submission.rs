@@ -473,7 +473,12 @@ impl ChatWidget {
         }
 
         self.maybe_apply_ide_context(&mut items);
-        crate::task_mentions::apply_task_references(&mut items, &mention_bindings, self.thread_id);
+        crate::task_mentions::apply_task_references_with_context(
+            &mut items,
+            &mention_bindings,
+            self.thread_id,
+            self.bottom_pane.task_contexts(),
+        );
 
         let collaboration_mode = if self.collaboration_modes_enabled() {
             self.active_collaboration_mask

@@ -79,6 +79,13 @@ mod archive;
 mod catalog;
 mod layout;
 mod page_loading;
+mod project_actions;
+mod projects;
+use project_actions::Destination;
+use projects::PickerProject;
+
+#[cfg(test)]
+mod project_filter_tests;
 mod sources;
 
 #[cfg(test)]
@@ -207,6 +214,12 @@ enum PickerLoadRequest {
         thread_id: ThreadId,
         revision: String,
     },
+    ProjectAction {
+        backend_id: crate::backend_id::BackendId,
+        project: PickerProject,
+        thread_id: Option<ThreadId>,
+        operation: project_actions::Operation,
+    },
     Page(PageLoadRequest),
     Preview {
         backend_id: crate::backend_id::BackendId,
@@ -241,6 +254,8 @@ enum SessionFilterMode {
     Cwd,
     Repo,
     All,
+    Project,
+    NonProject,
 }
 
 impl SessionFilterMode {
@@ -258,15 +273,20 @@ impl SessionFilterMode {
         filter_cwd: Option<&Path>,
         repo_filter_available: bool,
     ) -> Self {
-        match (self, direction) {
-            (Self::Cwd, ToolbarValueDirection::Next) if repo_filter_available => Self::Repo,
-            (Self::Cwd, ToolbarValueDirection::Next | ToolbarValueDirection::Previous)
-            | (Self::Repo, ToolbarValueDirection::Next) => Self::All,
-            (Self::Repo, ToolbarValueDirection::Previous) => Self::Cwd,
-            (Self::All, ToolbarValueDirection::Previous) if repo_filter_available => Self::Repo,
-            (Self::All, _) if filter_cwd.is_some() => Self::Cwd,
-            (Self::All, _) => Self::All,
+        let mut modes = Vec::new();
+        if filter_cwd.is_some() {
+            modes.push(Self::Cwd);
+            if repo_filter_available {
+                modes.push(Self::Repo);
+            }
         }
+        modes.extend([Self::All, Self::Project, Self::NonProject]);
+        let index = modes.iter().position(|mode| *mode == self).unwrap_or(0);
+        let index = match direction {
+            ToolbarValueDirection::Next => (index + 1) % modes.len(),
+            ToolbarValueDirection::Previous => (index + modes.len() - 1) % modes.len(),
+        };
+        modes[index]
     }
 }
 
@@ -279,10 +299,12 @@ enum SessionStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolbarControl {
     Filter,
+    Project,
     Status,
     Sort,
 }
 
+#[derive(Clone, Copy)]
 enum ToolbarValueDirection {
     Previous,
     Next,
@@ -292,6 +314,7 @@ impl ToolbarControl {
     fn previous(self, action: SessionPickerAction) -> Self {
         match self {
             Self::Filter => Self::Sort,
+            Self::Project => Self::Filter,
             Self::Status => Self::Filter,
             Self::Sort if matches!(action, SessionPickerAction::Resume) => Self::Status,
             Self::Sort => Self::Filter,
@@ -302,6 +325,13 @@ impl ToolbarControl {
         match self {
             Self::Filter if matches!(action, SessionPickerAction::Resume) => Self::Status,
             Self::Filter | Self::Status => Self::Sort,
+            Self::Project => {
+                if matches!(action, SessionPickerAction::Resume) {
+                    Self::Status
+                } else {
+                    Self::Sort
+                }
+            }
             Self::Sort => Self::Filter,
         }
     }
@@ -352,6 +382,10 @@ enum BackgroundEvent {
         backend_id: crate::backend_id::BackendId,
         thread_id: ThreadId,
         revision: Option<String>,
+    },
+    ProjectAction {
+        result: std::io::Result<project_actions::ActionResult>,
+        created: bool,
     },
     PartialPage {
         listing_token: usize,
@@ -491,6 +525,7 @@ struct SessionPickerRunOptions {
     view_persistence: Option<SessionPickerViewPersistence>,
     keymap: RuntimeKeymap,
     initial_page_mode: PageLoadMode,
+    projects: Result<Vec<PickerProject>, String>,
 }
 
 /// Interactive session picker that lists app-server threads with simple search,
@@ -631,6 +666,7 @@ async fn run_resume_picker_with_launch_context(
     let local_filter_cwd = local_picker_cwd_filter(&cwd_filter, uses_remote_filesystem);
     let provider_filter = ProviderFilter::All;
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
+    let projects = projects::load(app_server.session.request_handle()).await;
     let options = SessionPickerRunOptions {
         backend_id: app_server.session.backend_id(),
         cloud_backends: app_servers
@@ -656,6 +692,7 @@ async fn run_resume_picker_with_launch_context(
             codex_home: local_settings.codex_home.to_path_buf(),
         }),
         keymap: runtime_keymap,
+        projects,
         initial_page_mode: if uses_remote_workspace || has_multiple_backends {
             PageLoadMode::StoreDefault
         } else {
@@ -691,6 +728,7 @@ pub async fn run_fork_picker_with_app_server(
     let local_filter_cwd = local_picker_cwd_filter(&cwd_filter, uses_remote_filesystem);
     let provider_filter = picker_provider_filter(config, &app_server).await?;
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
+    let projects = projects::load(app_server.request_handle()).await;
     let options = SessionPickerRunOptions {
         backend_id: app_server.backend_id(),
         cloud_backends: (app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud)
@@ -714,6 +752,7 @@ pub async fn run_fork_picker_with_app_server(
             codex_home: local_settings.codex_home.to_path_buf(),
         }),
         keymap: runtime_keymap,
+        projects,
         initial_page_mode: if uses_remote_workspace {
             PageLoadMode::StoreDefault
         } else {
@@ -773,6 +812,23 @@ async fn run_session_picker_event_loop(
         options.action,
     );
     state.cloud_backends = options.cloud_backends;
+    match options.projects {
+        Ok(projects) => {
+            state.projects = projects;
+            state.projects_available = true;
+            state.selected_project = options
+                .filter_cwd
+                .as_ref()
+                .and_then(|cwd| {
+                    state
+                        .projects
+                        .iter()
+                        .position(|project| project.contains(cwd))
+                })
+                .unwrap_or(0);
+        }
+        Err(error) => state.inline_error = Some(format!("Project filters unavailable: {error}")),
+    }
     state.filter_mode =
         SessionFilterMode::from_show_all(options.show_all, options.filter_cwd.as_deref());
     state.filter_cwd = options.filter_cwd;
@@ -790,7 +846,7 @@ async fn run_session_picker_event_loop(
     state.request_frame();
 
     if let Ok(size) = alt.tui.terminal.size() {
-        let list_height = usize::from(layout::areas(Rect::from(size)).list.height);
+        let list_height = usize::from(layout::areas(Rect::from(size), &state).list.height);
         state.update_viewport(list_height, list_viewport_width(size.width));
         state.ensure_minimum_rows_for_view(list_height);
     }
@@ -835,7 +891,7 @@ async fn run_session_picker_event_loop(
                     TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                         let list_width = list_viewport_width(screen_size.width);
                         let list_height =
-                            usize::from(layout::areas(Rect::from(screen_size)).list.height);
+                            usize::from(layout::areas(Rect::from(screen_size), &state).list.height);
                         state.update_viewport(list_height, list_width);
                         state.ensure_minimum_rows_for_view(list_height);
                         draw_picker(alt.tui, &state, screen_size)?;
@@ -967,6 +1023,16 @@ fn spawn_app_server_source(backend: AppServerPickerBackend) -> sources::Source {
         let mut page_cwd_filter = PageCwdFilter::default();
         while let Some(request) = request_rx.recv().await {
             match request {
+                PickerLoadRequest::ProjectAction {
+                    project, thread_id, operation, ..
+                } => {
+                    let result =
+                        project_actions::execute(&archive_request_handle, project, thread_id, operation).await;
+                    let _ = bg_tx.send(BackgroundEvent::ProjectAction {
+                        result,
+                        created: thread_id.is_none(),
+                    });
+                }
                 PickerLoadRequest::Page(request) => {
                     let mode = request.mode;
                     let provider_filter = request.provider_filter;
@@ -1174,6 +1240,11 @@ struct PickerState {
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
     repo_filter_available: bool,
+    projects: Vec<PickerProject>,
+    projects_available: bool,
+    selected_project: usize,
+    project_destination: Option<Destination>,
+    project_management: Option<project_actions::Management>,
     toolbar_focus: ToolbarControl,
     density: SessionListDensity,
     launch_context: SessionPickerLaunchContext,
@@ -1283,6 +1354,7 @@ impl SearchState {
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Row {
+    project_id: Option<String>,
     backend_id: Option<crate::backend_id::BackendId>,
     history_mode: Option<ThreadHistoryMode>,
     path: Option<PathBuf>,
@@ -1396,6 +1468,11 @@ impl PickerState {
             local_cwd_matches: HashMap::new(),
             filter_cwd,
             repo_filter_available: false,
+            projects: Vec::new(),
+            projects_available: false,
+            selected_project: 0,
+            project_destination: None,
+            project_management: None,
             toolbar_focus: ToolbarControl::Filter,
             density: SessionListDensity::Comfortable,
             launch_context: SessionPickerLaunchContext::Startup,
@@ -1642,6 +1719,17 @@ impl PickerState {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
         self.inline_error = None;
+        if self.project_management.is_some() {
+            self.handle_management_key(key);
+            return Ok(None);
+        }
+        if self.project_destination.is_some() {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(Some(SessionSelection::Exit));
+            }
+            self.handle_destination_key(key);
+            return Ok(None);
+        }
         if self.is_transcript_loading() {
             return Ok(self.handle_transcript_loading_key(key));
         }
@@ -1653,6 +1741,12 @@ impl PickerState {
         // runtime keymap below.
         let allow_plain_char_navigation = !is_plain_text_key_event(key);
         match key {
+            KeyEvent { code: KeyCode::Char('z'), modifiers: KeyModifiers::ALT, .. }
+            | KeyEvent { code: KeyCode::F(2), .. } => self.open_project_destination(false),
+            KeyEvent { code: KeyCode::Char('x'), modifiers: KeyModifiers::ALT, .. }
+            | KeyEvent { code: KeyCode::F(3), .. } => self.open_project_destination(true),
+            KeyEvent { code: KeyCode::Char('n'), modifiers: KeyModifiers::ALT, .. } => self.open_project_create(),
+            KeyEvent { code: KeyCode::Char('d'), modifiers: KeyModifiers::ALT, .. } => self.open_project_delete(),
             KeyEvent {
                 code: KeyCode::Char('c'),
                 modifiers,
@@ -1841,7 +1935,7 @@ impl PickerState {
     }
 
     fn handle_paste(&mut self, pasted: String) {
-        if self.is_transcript_loading() {
+        if self.is_transcript_loading() || self.project_destination.is_some() {
             return;
         }
         let Some(pasted) = normalize_pasted_search_query(&pasted) else {
@@ -1902,6 +1996,32 @@ impl PickerState {
         event: BackgroundEvent,
     ) -> Result<Option<SessionSelection>> {
         match event {
+            BackgroundEvent::ProjectAction { result, created } => {
+                self.project_destination = None;
+                self.project_management = None;
+                match result {
+            Ok(project_actions::ActionResult::Thread(thread)) if created => {
+                        return Ok(Some(SessionSelection::Resume(SessionTarget {
+                            backend_id: self.backend_id,
+                            thread_id: ThreadId::from_string(&thread.id)?,
+                            path: thread.path,
+                            cwd: Some(thread.cwd.to_path_buf()),
+                            history_mode: Some(thread.history_mode),
+                        })));
+                    }
+                    Ok(project_actions::ActionResult::Projects(projects)) => {
+                        self.projects = projects;
+                        self.projects_available = true;
+                        self.selected_project = self.selected_project.min(self.projects.len().saturating_sub(1));
+                        self.start_initial_load();
+                    }
+                    Ok(_) => self.start_initial_load(),
+                    Err(error) => {
+                        self.inline_error = Some(format!("Project action failed: {error}"))
+                    }
+                }
+                self.request_frame();
+            }
             BackgroundEvent::PartialPage {
                 listing_token,
                 page,
@@ -2179,6 +2299,24 @@ impl PickerState {
     }
 
     fn row_matches_filter(&self, row: &Row) -> bool {
+        match self.filter_mode {
+            SessionFilterMode::Project => {
+                return self
+                    .projects
+                    .get(self.selected_project)
+                    .is_some_and(|project| match row.project_id.as_deref() {
+                        Some(id) => id == project.id,
+                        None => row.cwd.as_deref().is_some_and(|cwd| project.contains(cwd)),
+                    });
+            }
+            SessionFilterMode::NonProject => {
+                return row.project_id.is_none()
+                    && row.cwd.as_ref().is_some_and(|cwd| {
+                        !self.projects.iter().any(|project| project.contains(cwd))
+                    });
+            }
+            _ => {}
+        }
         self.filter_mode == SessionFilterMode::All
             || self.local_filter_cwd.is_none()
             || row
@@ -2396,11 +2534,23 @@ impl PickerState {
     }
 
     fn change_filter_mode(&mut self, direction: ToolbarValueDirection) {
-        let next_filter_mode = self.filter_mode.change(
+        let mut next_filter_mode = self.filter_mode.change(
             direction,
             self.filter_cwd.as_deref(),
             self.repo_filter_available,
         );
+        while !self.projects_available
+            && matches!(
+                next_filter_mode,
+                SessionFilterMode::Project | SessionFilterMode::NonProject
+            )
+        {
+            next_filter_mode = next_filter_mode.change(
+                direction,
+                self.filter_cwd.as_deref(),
+                self.repo_filter_available,
+            );
+        }
         if self.filter_mode == next_filter_mode {
             return;
         }
@@ -2419,20 +2569,52 @@ impl PickerState {
     fn active_cwd_filter(&self) -> Option<PathBuf> {
         match self.filter_mode {
             SessionFilterMode::Cwd | SessionFilterMode::Repo => self.filter_cwd.clone(),
-            SessionFilterMode::All => None,
+            SessionFilterMode::All | SessionFilterMode::Project | SessionFilterMode::NonProject => {
+                None
+            }
         }
     }
 
     fn focus_previous_toolbar_control(&mut self) {
-        self.toolbar_focus = self.toolbar_focus.previous(self.action);
+        self.toolbar_focus = match self.toolbar_focus {
+            ToolbarControl::Status if self.filter_mode == SessionFilterMode::Project => {
+                ToolbarControl::Project
+            }
+            ToolbarControl::Sort
+                if self.filter_mode == SessionFilterMode::Project
+                    && matches!(self.action, SessionPickerAction::Fork) =>
+            {
+                ToolbarControl::Project
+            }
+            _ => self.toolbar_focus.previous(self.action),
+        };
     }
 
     fn focus_next_toolbar_control(&mut self) {
-        self.toolbar_focus = self.toolbar_focus.next(self.action);
+        self.toolbar_focus = if self.toolbar_focus == ToolbarControl::Filter
+            && self.filter_mode == SessionFilterMode::Project
+        {
+            ToolbarControl::Project
+        } else {
+            self.toolbar_focus.next(self.action)
+        };
     }
 
     fn change_focused_toolbar_value(&mut self, direction: ToolbarValueDirection) {
         match self.toolbar_focus {
+            ToolbarControl::Project => {
+                if !self.projects.is_empty() {
+                    self.selected_project = match direction {
+                        ToolbarValueDirection::Next => {
+                            (self.selected_project + 1) % self.projects.len()
+                        }
+                        ToolbarValueDirection::Previous => {
+                            (self.selected_project + self.projects.len() - 1) % self.projects.len()
+                        }
+                    };
+                    self.start_initial_load();
+                }
+            }
             ToolbarControl::Sort => self.toggle_sort_key(),
             ToolbarControl::Filter => self.change_filter_mode(direction),
             ToolbarControl::Status => self.toggle_status(),
@@ -2586,6 +2768,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
     };
     let preview = thread.preview.trim();
     Some(Row {
+        project_id: thread.project_id,
         backend_id: None,
         history_mode: None,
         path: thread.path,
@@ -2716,6 +2899,7 @@ fn toolbar_for_width(state: &PickerState, width: u16) -> Line<'static> {
     // Keep the control affected by the arrow keys visible when the compact strip cannot fit.
     let spans = match state.toolbar_focus {
         ToolbarControl::Filter => filter_control_spans(state, /*compact*/ true),
+        ToolbarControl::Project => project_control_spans(state),
         ToolbarControl::Sort => sort_control_spans(state, /*compact*/ true),
         ToolbarControl::Status => vec![
             "Status:".set_style(secondary_text_style()),
@@ -2801,7 +2985,7 @@ fn sort_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>> 
 
 fn filter_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>> {
     let filter_focused = state.toolbar_focus == ToolbarControl::Filter;
-    if compact || state.filter_cwd.is_none() {
+    if compact {
         return vec![
             "Filter:".set_style(secondary_text_style()),
             toolbar_value(
@@ -2811,15 +2995,15 @@ fn filter_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>
             ),
         ];
     }
-    let mut values = vec![
-        "Filter: ".set_style(secondary_text_style()),
-        toolbar_value(
+    let mut values = vec!["Filter: ".set_style(secondary_text_style())];
+    if state.filter_cwd.is_some() {
+        values.push(toolbar_value(
             filter_mode_label(SessionFilterMode::Cwd),
             state.filter_mode == SessionFilterMode::Cwd,
             filter_focused,
-        ),
-    ];
-    if state.repo_filter_available {
+        ));
+    }
+    if state.filter_cwd.is_some() && state.repo_filter_available {
         values.push(toolbar_value(
             filter_mode_label(SessionFilterMode::Repo),
             state.filter_mode == SessionFilterMode::Repo,
@@ -2831,10 +3015,41 @@ fn filter_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>
         state.filter_mode == SessionFilterMode::All,
         filter_focused,
     ));
+    if state.projects_available {
+        for mode in [SessionFilterMode::Project, SessionFilterMode::NonProject] {
+            values.push(toolbar_value(
+                filter_mode_label(mode),
+                state.filter_mode == mode,
+                filter_focused,
+            ));
+        }
+    }
     values
 }
 
-fn toolbar_value(label: &'static str, active: bool, focused: bool) -> Span<'static> {
+fn project_control_spans(state: &PickerState) -> Vec<Span<'static>> {
+    let name = state
+        .projects
+        .get(state.selected_project)
+        .map(|project| project.name.as_str())
+        .unwrap_or("No saved projects");
+    vec![
+        "Project:".set_style(secondary_text_style()),
+        toolbar_value(
+            &truncate_text(name, 36),
+            true,
+            state.toolbar_focus == ToolbarControl::Project,
+        ),
+        format!(
+            " ({}/{})",
+            usize::from(!state.projects.is_empty()) + state.selected_project,
+            state.projects.len()
+        )
+        .set_style(secondary_text_style()),
+    ]
+}
+
+fn toolbar_value(label: &str, active: bool, focused: bool) -> Span<'static> {
     let value = format!(" {label} ");
     if active {
         value.set_style(if focused {
@@ -2853,6 +3068,8 @@ fn filter_mode_label(filter_mode: SessionFilterMode) -> &'static str {
         SessionFilterMode::Cwd => "Cwd",
         SessionFilterMode::Repo => "Repo",
         SessionFilterMode::All => "All",
+        SessionFilterMode::Project => "Project",
+        SessionFilterMode::NonProject => "Non-project",
     }
 }
 
@@ -2981,6 +3198,13 @@ fn picker_footer_scroll_percent(state: &PickerState, list_height: u16) -> u8 {
 }
 
 fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
+    if let Some(destination) = &state.project_destination {
+        return vec![Line::from(if destination.pending {
+            "Applying..."
+        } else {
+            "Up/Down select project · Enter apply · Esc cancel"
+        })];
+    }
     if state.is_transcript_loading() {
         let hints = [
             PickerFooterHint {
@@ -3029,6 +3253,16 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
         SessionListDensity::Dense => "comfy",
     };
     let mut first_row_hints = Vec::new();
+    if state.projects_available && matches!(state.action, SessionPickerAction::Resume) {
+        for (key, label) in [("Alt+Z", "new in project"), ("Alt+X", "move to project"), ("Alt+N", "create project"), ("Alt+D", "delete project")] {
+            first_row_hints.push(PickerFooterHint {
+                key: key.into(),
+                wide_label: label.into(),
+                compact_label: label.into(),
+                priority: 0,
+            });
+        }
+    }
     if let Some(accept) = state.keymap.list.primary_hint(ListAction::Accept) {
         first_row_hints.push(PickerFooterHint {
             key: accept.display_label(),
@@ -3062,7 +3296,11 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
         },
         PickerFooterHint {
             key: "tab".to_string(),
-            wide_label: String::from("focus sort/filter"),
+            wide_label: String::from(if state.projects_available {
+                "focus controls/project"
+            } else {
+                "focus sort/filter"
+            }),
             compact_label: String::from("focus"),
             priority: 7,
         },
@@ -3443,12 +3681,14 @@ fn render_comfortable_session_lines(
         .cwd
         .as_ref()
         .map(|path| format_directory_display(path, /*max_width*/ None));
-    let show_cwd = state.filter_mode == SessionFilterMode::All
-        || row
-            .cwd
-            .as_deref()
-            .zip(state.local_filter_cwd.as_deref())
-            .is_some_and(|(row_cwd, filter_cwd)| !paths_match(row_cwd, filter_cwd));
+    let show_cwd = matches!(
+        state.filter_mode,
+        SessionFilterMode::All | SessionFilterMode::Project | SessionFilterMode::NonProject
+    ) || row
+        .cwd
+        .as_deref()
+        .zip(state.local_filter_cwd.as_deref())
+        .is_some_and(|(row_cwd, filter_cwd)| !paths_match(row_cwd, filter_cwd));
     let footer_lines = render_footer_lines(
         state.sort_key,
         &created,
@@ -4277,6 +4517,7 @@ mod tests {
     pub(super) fn make_row(path: &str, ts: &str, preview: &str) -> Row {
         let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
         Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from(path)),
@@ -4360,6 +4601,7 @@ mod tests {
     #[test]
     fn row_display_preview_prefers_thread_name() {
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -4786,6 +5028,7 @@ mod tests {
         let thread_id =
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -4850,6 +5093,7 @@ mod tests {
         state.clock_format = ClockFormat::TwentyFourHour;
         state.relative_time_reference = parse_timestamp_str("2026-05-02T14:48:19Z");
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -5073,6 +5317,7 @@ mod tests {
         }
 
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -5101,6 +5346,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -5133,6 +5379,7 @@ mod tests {
         let unread_id = ThreadId::from_u128(/*value*/ 2);
         let mut rows = [
             Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -5145,6 +5392,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: Some(PathBuf::from("/tmp/b.jsonl")),
@@ -5157,6 +5405,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: Some(PathBuf::from("/tmp/c.jsonl")),
@@ -5653,6 +5902,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -5695,6 +5945,7 @@ mod tests {
         );
         state.filtered_rows = vec![
             Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: None,
@@ -5707,6 +5958,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: None,
@@ -5837,6 +6089,7 @@ mod tests {
         state.pending_transcript_open = Some((state.backend_id, thread_id));
         state.filtered_rows = vec![
             Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: None,
@@ -5849,6 +6102,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: None,
@@ -5907,6 +6161,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -5940,6 +6195,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -6130,6 +6386,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -6303,6 +6560,7 @@ session_picker_view = "dense"
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -6348,6 +6606,7 @@ session_picker_view = "dense"
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -6429,6 +6688,7 @@ session_picker_view = "dense"
 
     fn dense_snapshot_row() -> Row {
         Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -6671,6 +6931,7 @@ session_picker_view = "dense"
         let thread_id =
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -6744,6 +7005,7 @@ session_picker_view = "dense"
 
         let loader = page_only_loader(|_| {});
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -6808,6 +7070,7 @@ session_picker_view = "dense"
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
         state.all_rows = (0..5)
             .map(|idx| Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
@@ -6863,6 +7126,7 @@ session_picker_view = "dense"
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
         state.all_rows = (0..4)
             .map(|idx| Row {
+                project_id: None,
                 backend_id: None,
                 history_mode: None,
                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
@@ -7557,6 +7821,7 @@ session_picker_view = "dense"
         );
 
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: Some(PathBuf::from("/tmp/missing.jsonl")),
@@ -7599,6 +7864,7 @@ session_picker_view = "dense"
         );
         let thread_id = ThreadId::new();
         let row = Row {
+            project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,

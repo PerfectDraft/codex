@@ -823,14 +823,13 @@ impl App {
                     cwd: Some(target_thread.cwd.to_path_buf()),
                     history_mode: Some(target_thread.history_mode),
                 };
-                match self
-                    .resume_config_for_target(
-                        tui,
-                        app_server,
-                        &target_session,
-                        super::resume_preparation::ResumeSource::Active,
-                    )
-                    .await
+                match Box::pin(self.resume_config_for_target(
+                    tui,
+                    app_server,
+                    &target_session,
+                    super::resume_preparation::ResumeSource::Active,
+                ))
+                .await
                 {
                     Ok(config) => config,
                     Err(control) => return Ok(control),
@@ -842,14 +841,13 @@ impl App {
                     target_thread.cwd.to_path_buf()
                 };
                 let current_cwd = self.config.cwd.to_path_buf();
-                match self
-                    .rebuild_config_for_resume_or_fallback(
-                        &current_cwd,
-                        config_cwd,
-                        (&self.config, &self.local_settings),
-                        &self.app_server_target,
-                    )
-                    .await
+                match Box::pin(self.rebuild_config_for_resume_or_fallback(
+                    &current_cwd,
+                    config_cwd,
+                    (&self.config, &self.local_settings),
+                    &self.app_server_target,
+                ))
+                .await
                 {
                     Ok(config) => config,
                     Err(error) => {
@@ -941,15 +939,14 @@ impl App {
                 restored_blank_session = true;
                 (blank, false)
             } else {
-                match app_server
-                    .resume_thread_with_permission_overrides(
-                        &local_settings,
-                        resume_config.clone(),
-                        root_thread_id,
-                        resume_model_settings,
-                        self.resume_permission_overrides(&resume_config),
-                    )
-                    .await
+                match Box::pin(app_server.resume_thread_with_permission_overrides(
+                    &local_settings,
+                    resume_config.clone(),
+                    root_thread_id,
+                    resume_model_settings,
+                    self.resume_permission_overrides(&resume_config),
+                ))
+                .await
                 {
                     Ok(resumed) => {
                         provider_resume_checked = true;
@@ -1059,14 +1056,13 @@ impl App {
             );
             self.file_search
                 .update_search_dir(self.config.cwd.to_path_buf());
-            if let Err(error) = self
-                .replace_chat_widget_with_app_server_thread(
-                    tui,
-                    resumed,
-                    presentation,
-                    /*initial_user_message*/ None,
-                )
-                .await
+            if let Err(error) = Box::pin(self.replace_chat_widget_with_app_server_thread(
+                tui,
+                resumed,
+                presentation,
+                /*initial_user_message*/ None,
+            ))
+            .await
             {
                 self.add_agents_overview_error(format!("Failed to attach to task: {error}"));
                 return Ok(AppRunControl::Continue);
@@ -1158,8 +1154,7 @@ impl App {
         if self.current_displayed_thread_id() != Some(root_thread_id)
             || (self.thread_unavailable(root_thread_id) && !self.chat_widget.is_read_only_view())
         {
-            self.select_agent_thread(tui, app_server, root_thread_id)
-                .await?;
+            Box::pin(self.select_agent_thread(tui, app_server, root_thread_id)).await?;
         }
         if self.current_displayed_thread_id() == Some(root_thread_id) {
             self.remember_attached_host_project(app_server);

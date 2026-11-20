@@ -2649,7 +2649,7 @@ async fn task_mention_submission_and_transcript_preserve_the_visible_title() {
             continue;
         }
         assert!(matches!(items.as_slice(), [UserInput::Text { text, .. }]
-            if text.contains("MUST call `read_thread`")
+            if text.contains("use `read_thread` if that tool is available")
                 && text.contains("\"threadId\":\"task-123\"")
                 && text.ends_with("Inspect [@Review database migration](thread://task-123)")));
         assert_eq!(

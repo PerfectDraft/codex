@@ -994,7 +994,7 @@ impl App {
                 .map(|session| session.model_provider_id.as_str()),
         );
         self.chat_widget
-            .set_task_mentions_enabled(app_server.task_tools_available(thread_id));
+            .set_task_mentions_enabled(true);
         self.chat_widget
             .note_rendered_width(tui.terminal.last_known_screen_size.width);
         archived_thread::show_cached_read_only_thread(self, thread_id);
@@ -1187,9 +1187,9 @@ impl App {
             Ok(started) => {
                 self.chat_widget.mark_fresh_task_for_sparkle(&started);
                 let thread_id = started.session.thread_id;
+                self.chat_widget.set_task_mentions_enabled(/*enabled*/ true);
                 if started.task_tools_available {
                     app_server.remember_task_tool_thread(thread_id);
-                    self.chat_widget.set_task_mentions_enabled(/*enabled*/ true);
                 }
                 self.pending_primary_events.retain(|event| match event {
                     ThreadBufferedEvent::Notification(notification) => matches!(
@@ -1755,8 +1755,7 @@ impl App {
                     .start_fresh();
             }
         }
-        self.chat_widget
-            .set_task_mentions_enabled(started.task_tools_available);
+        self.chat_widget.set_task_mentions_enabled(true);
         self.chat_widget
             .note_rendered_width(tui.terminal.last_known_screen_size.width);
         if started.blocks_direct_input {

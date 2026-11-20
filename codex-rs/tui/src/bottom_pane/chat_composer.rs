@@ -677,6 +677,7 @@ pub(crate) struct ChatComposer {
     skills: Option<Vec<SkillMetadata>>,
     plugins: Option<Vec<PluginCapabilitySummary>>,
     task_mentions: Option<Vec<crate::task_mentions::TaskMention>>,
+    task_contexts: Vec<crate::task_mentions::TaskMention>,
     connectors_snapshot: Option<ConnectorsSnapshot>,
     collaboration_modes_enabled: bool,
     config: ChatComposerConfig,
@@ -867,6 +868,7 @@ impl ChatComposer {
             skills: None,
             plugins: None,
             task_mentions: None,
+            task_contexts: Vec::new(),
             connectors_snapshot: None,
             collaboration_modes_enabled: false,
             config,
@@ -970,6 +972,9 @@ impl ChatComposer {
 
     pub(crate) fn set_task_mentions_enabled(&mut self, enabled: bool) {
         self.task_mentions = enabled.then(Vec::new);
+        if !enabled {
+            self.task_contexts.clear();
+        }
         self.refresh_mentions_v2_popup_candidates();
         if enabled
             && matches!(self.popups.active, ActivePopup::MentionV2(_))
@@ -1005,8 +1010,22 @@ impl ChatComposer {
         let Some(task_mentions) = &mut self.task_mentions else {
             return;
         };
+        for task in &matches {
+            self.task_contexts
+                .retain(|entry| entry.thread_id != task.thread_id);
+            self.task_contexts.push(task.clone());
+        }
+        let excess = self
+            .task_contexts
+            .len()
+            .saturating_sub(crate::task_mentions::MAX_REFERENCED_TASKS * 2);
+        self.task_contexts.drain(..excess);
         *task_mentions = matches;
         self.refresh_mentions_v2_popup_candidates();
+    }
+
+    pub(crate) fn task_contexts(&self) -> &[crate::task_mentions::TaskMention] {
+        &self.task_contexts
     }
 
     /// Refreshes an open mention catalog when skill or plugin metadata changes.
@@ -7937,6 +7956,7 @@ mod tests {
                                 label_style: crate::thread_label::ThreadLabelStyle::Cloud,
                                 cwd: "/workspace/project".to_string(),
                                 snippet: "database migration".to_string(),
+                                context: None,
                             },
                             crate::task_mentions::TaskMention {
                                 thread_id: "task-456".to_string(),
@@ -7944,6 +7964,7 @@ mod tests {
                                 label_style: crate::thread_label::ThreadLabelStyle::Plain,
                                 cwd: "/another/project".to_string(),
                                 snippet: "migration".to_string(),
+                                context: None,
                             },
                         ],
                     );
@@ -7977,6 +7998,7 @@ mod tests {
             label_style: crate::thread_label::ThreadLabelStyle::Plain,
             cwd: "/workspace/project".to_string(),
             snippet: String::new(),
+            context: None,
         };
         composer.on_task_search_result("task", vec![task.clone()]);
         composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

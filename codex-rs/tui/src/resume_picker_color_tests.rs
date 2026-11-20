@@ -15,6 +15,7 @@ fn thread_colors_and_selection_contrast_in_both_picker_layouts() {
             .clone(),
     );
     let row = Row {
+        project_id: None,
         backend_id: None,
         history_mode: None,
         path: None,
@@ -168,6 +169,7 @@ fn compact_picker_keeps_metadata_and_labeled_primary_actions() {
     state.relative_time_reference = timestamp;
     state.filtered_rows = (1..=6)
         .map(|id| Row {
+        project_id: None,
             backend_id: None,
             history_mode: None,
             path: None,
@@ -198,7 +200,7 @@ fn compact_picker_keeps_metadata_and_labeled_primary_actions() {
                 let mut terminal = Terminal::with_options(backend).expect("terminal");
                 let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
                 terminal.set_viewport_area(area);
-                let list = layout::areas(area).list;
+                let list = layout::areas(area, &state).list;
                 state.update_viewport(usize::from(list.height), list_viewport_width(width));
                 {
                     let mut frame = terminal.get_frame();
@@ -300,7 +302,7 @@ async fn narrow_toolbar_keeps_keyboard_focused_control_visible() {
                         let mut terminal = Terminal::with_options(backend).expect("terminal");
                         let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
                         terminal.set_viewport_area(area);
-                        let list = layout::areas(area).list;
+                        let list = layout::areas(area, &state).list;
                         state.update_viewport(usize::from(list.height), list_viewport_width(width));
                         let mut frame = terminal.get_frame();
                         layout::render(&mut frame, &state);

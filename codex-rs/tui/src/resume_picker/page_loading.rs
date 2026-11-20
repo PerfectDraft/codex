@@ -29,7 +29,9 @@ impl PageCwdFilter {
                 SessionFilterMode::Repo => {
                     cwd.map(|cwd| repository_cwd_filter(cwd, uses_remote_filesystem))
                 }
-                SessionFilterMode::All => None,
+                SessionFilterMode::All
+                | SessionFilterMode::Project
+                | SessionFilterMode::NonProject => None,
             };
         }
         self.current.clone()

@@ -535,6 +535,10 @@ impl BottomPane {
         self.composer.task_mentions_enabled()
     }
 
+    pub(crate) fn task_contexts(&self) -> &[crate::task_mentions::TaskMention] {
+        self.composer.task_contexts()
+    }
+
     pub(crate) fn on_task_search_result(
         &mut self,
         query: &str,
