@@ -1,4 +1,5 @@
 name: Build project-filter CLI for Windows
+run-name: Windows project filter ${{ inputs.tag }}
 on:
   workflow_dispatch:
     inputs:

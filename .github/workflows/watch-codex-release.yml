@@ -1,0 +1,51 @@
+name: Check for a new Codex release
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: check-upstream-codex
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository == 'PerfectDraft/codex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check upstream and dispatch Windows build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/openai/codex/releases/latest --jq '.tag_name')
+          if ! [[ "$tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Latest upstream release is $tag; waiting for a stable Rust release."
+            exit 0
+          fi
+          api="repos/$GITHUB_REPOSITORY/actions"
+          workflow=project-filter-windows.yml
+          name="codex-project-filter-$tag-windows-x64"
+          artifacts=$(gh api "$api/artifacts?name=$name&per_page=100")
+          ids=$(jq -r --arg name "$name" '.artifacts[] | select(.name==$name and (.expired|not) and .workflow_run.head_branch=="main") | .workflow_run.id' <<< "$artifacts")
+          for id in $ids; do
+            valid=$(gh api "$api/runs/$id" --jq '.path == ".github/workflows/project-filter-windows.yml" and .event == "workflow_dispatch" and .conclusion == "success"')
+            if [[ "$valid" == true ]]; then
+              echo "$tag already has a verified build from run $id." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          # A failed patch needs attention; avoid dispatching it every 15 minutes.
+          titles=$(gh api --paginate "$api/workflows/$workflow/runs?branch=main&event=workflow_dispatch&per_page=100" --jq '.workflow_runs[].display_title')
+          if grep -Fxq "Windows project filter $tag" <<< "$titles"; then
+            echo "Build for $tag was already requested. See the Windows workflow for its result." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref main -f "tag=$tag"
+          echo "Requested Windows build for $tag." >> "$GITHUB_STEP_SUMMARY"
